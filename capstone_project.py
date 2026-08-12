@@ -1,115 +1,491 @@
+"""
+capstone_project.py
+===================
+Claude Certified Architect — Capstone: multi-agent customer support demo
+
+Purpose
+    This module is an educational, reference-quality demonstration of a small
+    production-minded multi-agent architecture for customer support. It focuses
+    on safe, structured interactions between a coordinator and focused
+    subagents, showing how to decompose work, enforce policy gates, normalize
+    raw tool outputs, and escalate to humans when appropriate.
+
+Core concepts illustrated
+    - Ep 01 — Agentic loop: a send/receive loop that respects the model's
+        `stop_reason` values. The loop supports `tool_use` responses (the model
+        asks to call a tool) and `end_turn` responses (final assistant output).
+    - Ep 02 — Coordinator pattern: a coordinator decomposes high-level
+        requests into subtasks and invokes subagents. Each subagent receives only
+        the explicit, minimal context the coordinator passes to it.
+    - Ep 03 — Structured context passing: subagents return structured findings
+        (typed dicts) instead of free-form prose so downstream agents can act
+        deterministically and with fewer tokens.
+
+Key features and safety hooks
+    - Pre-tool hooks: policy gates that run before any tool call (e.g. identity
+        verification and refund limits). A blocking hook returns a structured
+        decision describing why a call was denied and what must happen next.
+    - Post-tool hooks: normalize raw backend results for model consumption
+        (timestamps → readable dates, cents → formatted currency) and update
+        session state (e.g. set `customer_verified`).
+    - Tool schemas: explicit descriptions the model reads to choose the right
+        tool and avoid misusing tools (what to call, when to call it, and what it
+        returns).
+    - Central tool handler: runs pre-hooks, invokes the registered tool
+        function, applies post-hooks, and maps exceptions into structured
+        tool_result objects (transient, permission, validation, internal).
+
+Examples included
+    - Customer verification followed by refund processing (coordinator + two
+        subagents). Shows how verification gates and refund-policy enforcement
+        can trigger escalation to a human.
+    - Explicit customer request to speak to a human: demonstrates intent-based
+        escalation which bypasses verification (honor the customer's request).
+
+How to run
+    - Install dependencies: `pip install anthropic`
+    - Set API key in your environment. On Windows: `set ANTHROPIC_API_KEY=sk-ant-...`
+    - Run: `python capstone_project.py`
+
+Notes
+    - This demo uses in-memory `FAKE_DB` and `FAKE_ORDERS`—no external
+        integrations or network calls are made beyond the demonstration model
+        client. The code is intentionally explicit about when to escalate and why.
+
+Intended audience
+    - Engineers and architects learning multi-agent coordination, tool
+        grounding, and practical guardrails for safe tool usage.
+"""
+
 import anthropic
 import json
 from datetime import datetime
 
-# The client is the connection point to Anthropic's Messages API. Authentication
-# is expected to be configured in the environment rather than stored in this file.
 client = anthropic.Anthropic()
-# Keep the model name in one place so every subagent uses the same model and the
-# model can be changed without editing each API call individually.
-MODEL = "claude-haiku-4-5"
+MODEL  = "claude-haiku-4-5"
 
-# These dictionaries act as a small in-memory database for the demonstration.
-# Customer IDs are the keys, while each value contains the fields returned by the
-# customer lookup tool. A real application would replace this with a database.
+# ─────────────────────────────────────────────
+# FAKE TOOLS  (no real API calls needed)
+# These simulate what real tools would return.
+# ─────────────────────────────────────────────
+
 FAKE_DB = {
-    "C001":{"name":"Alex", "email":"alex@gmail.com", "plan":"elite"},
-    "C002":{"name":"Bob", "email":"BobMarley@gmail.com","plan":"Gold"}
+    "C001": {"name": "Alice", "email": "alice@example.com", "plan": "pro"},
+    "C002": {"name": "Bob",   "email": "bob@example.com",   "plan": "free"},
 }
 
-# Orders are also stored in memory. Each order links back to a customer through
-# customer_id, which lets the refund subagent verify ownership before refunding.
+# Raw DB-style records: status codes, Unix timestamps, cents.
+# These are intentionally "unfriendly" so our PostToolUse hook has work to do.
 FAKE_ORDERS = {
-    "0100":{"customer_id":"C001", "item":"Iphone 16", "amount":100000.00, "status":"delivered"},
-    "0101":{"customer_id":"C002", "item":"Pixel 7", "amount":150000.00, "status":"refunded"}
+    "O100": {
+        "customer_id":  "C001",
+        "items":        ["Annual Plan"],
+        "amount_cents": 9900,
+        "status":       3,            # 3 = Delivered
+        "ordered_at":   1740009600,   # Unix ts → Feb 20, 2025
+    },
+    "O101": {
+        "customer_id":  "C002",
+        "items":        ["Monthly Plan"],
+        "amount_cents": 900,
+        "status":       5,            # 5 = Refunded
+        "ordered_at":   1738886400,   # Unix ts → Feb 07, 2025
+    },
+    "O102": {
+        "customer_id":  "C001",
+        "items":        ["Enterprise Plan (annual)"],
+        "amount_cents": 75000,        # $750 → triggers PreToolUse block
+        "status":       3,            # 3 = Delivered
+        "ordered_at":   1740614400,   # Unix ts → Feb 27, 2025
+    },
 }
+
+# Mutable session state shared across subagents within one coordinator run.
+# The prerequisite gate reads this; the verification PostToolUse hook writes it.
+session = {"customer_verified": False, "customer_id": None}
 
 def get_customer(customer_id: str) -> dict:
-    # Look up the requested customer. The first return handles the current data;
-    # the second return documents the intended not-found response but is currently
-    # unreachable because the function returns immediately above it.
     customer = FAKE_DB.get(customer_id)
-    return{"Found":True, "customer_id": customer_id, **customer}
-    return{"Found":False, "error":f"No Customer with the id{customer_id}"}
+    if customer:
+        return {"found": True, "customer_id": customer_id, **customer}
+    return {"found": False, "error": f"No customer with id {customer_id}"}
 
 def lookup_order(order_id: str) -> dict:
-    # Return a normalized result containing both the requested ID and the order
-    # fields. Returning an explicit error object keeps tool responses predictable
-    # for the language model when the order does not exist.
     order = FAKE_ORDERS.get(order_id)
     if order:
-        return{"Found": True, "order_id":order_id, **order}
-    return{"Found":False, "error":f"No Order with id {order_id}"}
+        # Return RAW fields (id, status code, Unix ts, cents).
+        # The PostToolUse hook will normalize these before the model sees them.
+        return {"found": True, "id": order_id, **order}
+    return {"found": False, "error": f"No order with id {order_id}"}
 
-def process_refund(order_id: str, amount: float) ->dict:
-    # This function represents the side-effecting operation in the example.
-    # Validate the order before issuing a refund, and reject duplicate refunds.
+def process_refund(order_id: str, amount: float) -> dict:
     order = FAKE_ORDERS.get(order_id)
     if not order:
-        return {"Success": False, "error":"Order not found"}
-    if order["status"] == "refunded":
-        return {"Success" : False, "error" :"Order already refunded"}
-    return {"Success": True, "refund_id": f"REF-{order_id}", "amount": amount}
+        return {"success": False, "error": "Order not found"}
+    if order["status"] == 5:  # 5 = Refunded (raw status code)
+        return {"success": False, "error": "Order already refunded"}
+    return {"success": True, "refund_id": f"REF-{order_id}", "amount": amount}
 
-# The model only knows tool names and schemas. This registry is the trusted local
-# dispatch table that maps a tool name selected by the model to Python code.
+def escalate_to_human(reason: str, customer_id: str = None) -> dict:
+    """Hand the conversation off to a human support agent.
+
+    There is no real human agent in this demo, so this simulates the handoff:
+    it prints a clear banner and returns a structured handoff record. In
+    production this would open a ticket or page the on-call support queue.
+
+    Note: this tool is intentionally NOT behind the verification gate — when a
+    customer explicitly asks for a human, we escalate immediately rather than
+    forcing them to verify their identity first.
+    """
+    cid = customer_id or session.get("customer_id")
+    ticket_id = f"ESC-{cid or 'GUEST'}-{datetime.now().strftime('%H%M%S')}"
+    print("\n  " + "═" * 48)
+    print("  🧑‍💼  ESCALATED TO A HUMAN AGENT")
+    print(f"  Ticket:   {ticket_id}")
+    print(f"  Customer: {cid or 'not provided'}")
+    print(f"  Reason:   {reason}")
+    print("  " + "═" * 48)
+    return {
+        "escalated":   True,
+        "ticket_id":   ticket_id,
+        "customer_id": cid,
+        "reason":      reason,
+        "message":     "Connected to a human agent. A specialist will take over from here.",
+    }
+
+# Map tool names → functions
 TOOL_REGISTRY = {
-    "get_customer": get_customer,
-    "lookup_order": lookup_order,
-    "process_refund": process_refund
+    "get_customer":      get_customer,
+    "lookup_order":      lookup_order,
+    "process_refund":    process_refund,
+    "escalate_to_human": escalate_to_human,
 }
 
-# These JSON-compatible definitions tell Claude which tools are available, what
-# each tool does, and exactly which arguments must be supplied in a tool call.
-# The schemas are sent with every Messages API request made by the agent loop.
+# ─────────────────────────────────────────────
+# PRE-TOOL-USE HOOK
+# Runs BEFORE a tool executes. Can block the call outright (policy gate).
+# Use it for guardrails: spend limits, PII checks, destructive-action review.
+# ─────────────────────────────────────────────
+
+def prerequisite_gate(tool_name, tool_params):
+    """PreToolUse: block refund/lookup until the customer has been verified."""
+    if tool_name in ("process_refund", "lookup_order"):
+        if not session["customer_verified"]:
+            return {
+                "allowed":       False,
+                "reason":        "Call get_customer first to verify identity.",
+                "required_tool": "get_customer",
+            }
+    return {"allowed": True}
+
+def enforce_refund_policy(tool_name, tool_params):
+    """PreToolUse: block refunds above the $500 agent limit."""
+    if tool_name != "process_refund":
+        return {"allowed": True}   # pass through — only gate refunds
+
+    amount = tool_params.get("amount", 0)   # our schema uses USD floats
+
+    if amount > 500:
+        return {
+            "allowed":         False,
+            "reason":          f"Refund ${amount:.2f} exceeds $500 agent limit.",
+            "action_required": "escalate_to_human",
+            "escalation_tier": "senior_support",
+        }
+
+    return {"allowed": True}
+
+# Registry of pre-tool-use hooks. First hook that returns allowed=False wins.
+# Order matters: check prerequisites BEFORE business-rule checks.
+PRE_TOOL_HOOKS = [prerequisite_gate, enforce_refund_policy]
+
+def apply_pre_tool_hooks(tool_name, tool_params):
+    """Run hooks in order; stop at the first block. Returns the decision dict."""
+    for hook in PRE_TOOL_HOOKS:
+        decision = hook(tool_name, tool_params)
+        if not decision.get("allowed", True):
+            return decision
+    return {"allowed": True}
+
+# ─────────────────────────────────────────────
+# POST-TOOL-USE HOOK
+# Runs AFTER a tool returns, BEFORE the result is sent back to the model.
+# Use it to reshape raw data into a model-friendly form (and save tokens).
+# ─────────────────────────────────────────────
+
+def normalize_order_result(tool_name, raw_result):
+    if tool_name != "lookup_order":
+        return raw_result   # pass through — only normalize lookup_order
+    if not raw_result.get("found"):
+        return raw_result   # don't touch error shapes
+
+    # Map status codes → human-readable strings
+    status_map = {
+        1: "Processing",  2: "Shipped",
+        3: "Delivered",   4: "Return Initiated",  5: "Refunded",
+    }
+
+    # Convert Unix timestamp → readable date
+    order_date = datetime.utcfromtimestamp(
+        raw_result["ordered_at"]
+    ).strftime("%B %d, %Y")   # "February 20, 2025"
+
+    # Convert cents → display currency
+    amount = f"${raw_result['amount_cents'] / 100:.2f}"
+
+    return {
+        "order_id":    raw_result["id"],
+        "customer_id": raw_result["customer_id"],
+        "status":      status_map.get(raw_result["status"], "Unknown"),
+        "order_date":  order_date,   # ← readable date
+        "amount":      amount,       # ← formatted currency
+        "items":       raw_result["items"],
+    }
+
+def update_verification_state(tool_name, raw_result):
+    """PostToolUse: flip the verification flag ONLY if get_customer succeeded.
+
+    This must live in PostToolUse — not PreToolUse — because only after the
+    tool runs do we know whether the customer actually exists.
+    """
+    if tool_name == "get_customer" and raw_result.get("found"):
+        session["customer_verified"] = True
+        session["customer_id"]       = raw_result.get("customer_id")
+        print(f"  [HOOK] Verified session for {session['customer_id']}")
+    return raw_result   # pass the result through unchanged
+
+# Registry of post-tool-use hooks. Add more hooks here as the system grows.
+POST_TOOL_HOOKS = [normalize_order_result, update_verification_state]
+
+def apply_post_tool_hooks(tool_name, raw_result):
+    """Run every registered hook in order. Each hook sees the previous output."""
+    result = raw_result
+    for hook in POST_TOOL_HOOKS:
+        result = hook(tool_name, result)
+    return result
+
+# ─────────────────────────────────────────────
+# TOOL SCHEMAS
+# These descriptions are the ONLY thing the model reads when deciding
+# which tool to call and in what order. Four levers:
+#   1. WHAT it does        — so the model picks the right tool
+#   2. WHEN to call it     — ordering & prerequisites
+#   3. WHAT NOT to use it for — prevents common mix-ups
+#   4. WHAT it returns     — so the model knows what data it'll get back
+# ─────────────────────────────────────────────
+
 TOOLS = [
     {
-        "name":"get_customer",
-        "description":"Fetch customer record by customer ID. Return name, email and plan tier.",
+        "name": "get_customer",
+        "description": (
+            "Retrieve a verified customer profile by customer ID. "
+            "Returns name, email, plan tier, and account standing. "
+            "ALWAYS call this FIRST before any other tool — the system "
+            "requires customer verification before order lookups or refunds. "
+            "Do NOT use this for order details; use lookup_order instead."
+        ),
         "input_schema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string", "description":"Customer Id, e.g. C001" }
+            "type": "object",
+            "properties": {
+                "customer_id": {
+                    "type": "string",
+                    "description": "Customer ID (format: C followed by digits, e.g. C001)",
+                }
             },
-            "required":["customer_id"]
+            "required": ["customer_id"]
         }
     },
     {
-        "name":"lookup_order",
-        "description":"Fetch order details by order ID. Returns item, amount, status, and linked Customer ID.",
+        "name": "lookup_order",
+        "description": (
+            "Fetch full order details by order ID. "
+            "Returns item list, amount, order date, delivery status, and "
+            "the linked customer_id. "
+            "REQUIRES: get_customer must have been called first to verify identity. "
+            "Do NOT use this to issue refunds; use process_refund for that."
+        ),
         "input_schema": {
-            "type":"object",
-            "properties":{
-                "order_id":{"type":"string", "description":"Order Id, e.g. 0100"}
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "Order ID (format: O followed by digits, e.g. O100)",
+                }
             },
-            "required":["order_id"]
+            "required": ["order_id"]
         }
     },
     {
-        "name":"process_refund",
-        "description":"Issue a refund for an order. Only call this after verifying the customer exist and order belongs to them.",
+        "name": "process_refund",
+        "description": (
+            "Issue a monetary refund for a specific order. "
+            "REQUIRES: call get_customer first to verify identity, then "
+            "call lookup_order to confirm the order exists and belongs to "
+            "that customer. Only call this AFTER both checks pass. "
+            "Do NOT guess the amount — use the exact amount from lookup_order."
+        ),
         "input_schema": {
-            "type":"object",
-            "properties":{
-                "order_id":{"type":"string"},
-                "amount":{"type":"number", "description":"Amount to refund in INR"}
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "The order ID to refund (must match a prior lookup_order call)",
+                },
+                "amount": {
+                    "type": "number",
+                    "description": "Refund amount in USD — must match the order total from lookup_order",
+                }
             },
-            "required":["order_id", "amount"]
+            "required": ["order_id", "amount"]
+        }
+    },
+    {
+        "name": "escalate_to_human",
+        "description": (
+            "Hand the conversation off to a human support agent. "
+            "Call this IMMEDIATELY when the customer explicitly asks to speak "
+            "to a human, a manager, or a real person — do NOT insist on "
+            "verifying identity or resolving the issue yourself first. "
+            "Also call this when a request exceeds your authority (e.g. a "
+            "refund above the $500 agent limit) or after repeated failures. "
+            "Returns a confirmation that the handoff was created."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason for the handoff (e.g. 'customer explicitly requested a human agent')",
+                },
+                "customer_id": {
+                    "type": "string",
+                    "description": "Customer ID if known (optional — not required to escalate)",
+                }
+            },
+            "required": ["reason"]
         }
     }
 ]
 
+
+# ─────────────────────────────────────────────
+# TOOL CALL HANDLER
+# Centralizes pre-hook, dispatch, post-hook, and structured error handling.
+# Each error category carries enough metadata for the coordinator to decide:
+#   transient  → retry after delay (infra hiccup, safe to re-attempt)
+#   permission → escalate; retrying won't help
+#   validation → model should correct its params before retrying
+#   internal   → unexpected; surface to coordinator / human
+# ─────────────────────────────────────────────
+
+def handle_tool_call(tool_name: str, tool_id: str, tool_input: dict) -> dict:
+    """
+    Execute one tool call end-to-end and return a tool_result dict.
+    Runs pre-tool hooks (policy gate), the tool itself, and post-tool hooks.
+    All errors become structured tool_result responses — never bare exceptions.
+    """
+    # ── PreToolUse: policy gate ───────────────────────────────────────────
+    decision = apply_pre_tool_hooks(tool_name, tool_input)
+    if not decision["allowed"]:
+        print(f"  [HOOK] BLOCKED {tool_name}({tool_input})")
+        print(f"  [HOOK] Reason: {decision['reason']}")
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "is_error":    True,
+            "content":     json.dumps(decision),
+        }
+
+    print(f"  [TOOL] Calling {tool_name}({tool_input})")
+
+    try:
+        raw_result = TOOL_REGISTRY[tool_name](**tool_input)
+        print(f"  [TOOL] Raw result:        {raw_result}")
+
+        # ── PostToolUse: reshape raw data before the model sees it ────────
+        result = apply_post_tool_hooks(tool_name, raw_result)
+        if result is not raw_result:
+            print(f"  [HOOK] Normalized result: {result}")
+
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "content":     json.dumps(result),
+        }
+
+    except TimeoutError as e:
+        # ⚠️  Transient — infrastructure hiccup; safe to retry after a delay
+        print(f"  [TOOL] ERROR: TimeoutError on {tool_name}")
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "is_error":    True,
+            "content":     json.dumps({
+                "errorCategory": "transient",
+                "isRetryable":   True,
+                "description":   f"Timeout calling {tool_name}: {str(e)}",
+                "retryAfterMs":  2000,
+            }),
+        }
+
+    except PermissionError as e:
+        # 🔒 Permission — agent lacks access; retrying won't help; escalate
+        print(f"  [TOOL] ERROR: PermissionError on {tool_name}")
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "is_error":    True,
+            "content":     json.dumps({
+                "errorCategory": "permission",
+                "isRetryable":   False,
+                "description":   f"Access denied for {tool_name}: {str(e)}",
+            }),
+        }
+
+    except ValueError as e:
+        # ❌ Validation — bad input params; model should self-correct, not retry
+        print(f"  [TOOL] ERROR: ValueError on {tool_name}")
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "is_error":    True,
+            "content":     json.dumps({
+                "errorCategory": "validation",
+                "isRetryable":   False,
+                "description":   f"Invalid input for {tool_name}: {str(e)}",
+            }),
+        }
+
+    except Exception as e:
+        # 💥 Internal — unexpected; log and surface to coordinator
+        print(f"  [TOOL] ERROR: {type(e).__name__} on {tool_name}")
+        return {
+            "type":        "tool_result",
+            "tool_use_id": tool_id,
+            "is_error":    True,
+            "content":     json.dumps({
+                "errorCategory": "internal",
+                "isRetryable":   False,
+                "description":   f"Unexpected error in {tool_name}: {str(e)}",
+            }),
+        }
+
+
+# ─────────────────────────────────────────────
+# EP 01 — AGENTIC LOOP
+# The core loop: send → check stop_reason → run tools → repeat
+# ─────────────────────────────────────────────
+
 def run_agentic_loop(system_prompt: str, user_message: str, tools: list) -> str:
-    # Messages API conversations are represented as an ordered list. The loop
-    # starts with the user's task and appends assistant tool requests plus the
-    # corresponding tool results until Claude produces a final text response.
-    messages = [{"role" : "user", "content":user_message}]
-    print(f"\n [LOOP] Starting. User: {user_message[:60]}....")
+    """
+    Ep 01 concept: the agentic loop.
+    Keeps running until stop_reason == "end_turn".
+    Correctly appends assistant message BEFORE tool results each round.
+    """
+    messages = [{"role": "user", "content": user_message}]
+    print(f"\n  [LOOP] Starting. User: {user_message[:60]}...")
 
     while True:
-        # Claude may either finish the task or request one or more tools. Supplying
-        # the accumulated messages preserves the complete reasoning context across
-        # multiple API round trips.
         response = client.messages.create(
             model=MODEL,
             max_tokens=1024,
@@ -118,132 +494,240 @@ def run_agentic_loop(system_prompt: str, user_message: str, tools: list) -> str:
             messages=messages
         )
 
-        print(f" [LOOP] stop_reason = {response.stop_reason}")
+        print(f"  [LOOP] stop_reason = {response.stop_reason}")
+
+        # ── Ep 01: stop_reason == "end_turn" → we're done ──
         if response.stop_reason == "end_turn":
-            # A final response can contain several content blocks. Select the
-            # first block that exposes text and return it to the calling subagent.
-            final_text = next((b.text for b in response.content if hasattr(b, "text")),"")
-            print(f" [LOOP] Done. Response: {final_text[:80]}.....")
+            final_text = next(
+                (b.text for b in response.content if hasattr(b, "text")), ""
+            )
+            print(f"  [LOOP] Done. Response: {final_text[:80]}...")
             return final_text
 
+        # ── Ep 01: stop_reason == "tool_use" → run tools ──
         if response.stop_reason == "tool_use":
-            # Preserve Claude's tool-use message before sending results back. The
-            # API requires the assistant request and user tool results to remain in
-            # the conversation in this order.
-            messages.append({"role":"assistant", "content": response.content})
 
+            # Step 1: append the FULL assistant message first (Ep 01 rule)
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Step 2: collect tool results — handle_tool_call owns all error logic
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    # Execute only registered local functions. The model proposes
-                    # the name and arguments, while this application performs the
-                    # actual function call and serializes its result as JSON.
-                    print(f" [TOOL] Calling {block.name}({block.input})")
-                    result = TOOL_REGISTRY[block.name](**block.input)
-                    print(f" [TOOL] Result: {result}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id":block.id,
-                        "content": json.dumps(result)
-                    })
+                    tool_results.append(handle_tool_call(block.name, block.id, block.input))
 
-            messages.append({"role":"user", "content": tool_results})
+            # Step 3: append tool results as a user message
+            messages.append({"role": "user", "content": tool_results})
+            # Loop continues → next iteration sends full history
+
+
+# ─────────────────────────────────────────────
+# EP 02 — COORDINATOR PATTERN
+# The coordinator decomposes the task and delegates to subagents.
+# Each subagent gets only what the coordinator explicitly passes.
+# ─────────────────────────────────────────────
 
 def run_subagent(role: str, task_prompt: str, tools: list) -> dict:
-    # A subagent is a focused agent with a role-specific prompt and a restricted
-    # tool list. Restricting tools helps each subagent stay within its responsibility
-    # instead of allowing every agent to perform every operation.
-    print(f"\n SubAgent [{role}] starting...")
-    # Extract a short human-readable task description for the system prompt. The
-    # complete task_prompt is still passed to the agent loop unchanged below.
-    job_desc = task_prompt.split('Task:')[-1].split('\n')[0].strip() if 'Task' in task_prompt else 'complete your assigned Task'
+    """
+    Ep 02 concept: subagent invocation.
+    The subagent is just another agentic loop — but with a focused role
+    and only the context the coordinator chose to give it.
+    Returns a structured result (not prose) for Ep 03 context passing.
+    """
+    print(f"\n  ── Subagent [{role}] starting ──")
+    job_desc = task_prompt.split('Task:')[-1].split('\n')[0].strip() if 'Task:' in task_prompt else 'complete your assigned task'
     system_prompt = f"""You are the {role} subagent in a customer support system.
-    Your Job: {job_desc}
-    Be Concise, Return factual results only. DO NOT make up data."""
+Your job: {job_desc}
+Be concise. Return factual results only. Do not make up data.
 
-    # Run the same reusable tool-calling loop with this subagent's instructions.
+────────────────────────────────────────────────
+FEW-SHOT EXAMPLES — resolve vs. escalate reasoning
+Use these to decide when to act directly and when to hand off.
+Always state your Reasoning before your Action.
+────────────────────────────────────────────────
+
+EXAMPLE 1 — Resolve directly:
+Customer: "My invoice shows an extra charge from last month.
+          I've been a customer for 4 years."
+Reasoning: Billing discrepancy + long-tenure = high trust context.
+           Amount not stated but likely small. Goodwill resolution
+           appropriate. No service failure involved.
+Action: RESOLVE — apply $20 credit, apologize, close ticket
+
+EXAMPLE 2 — Escalate:
+Customer: "I've been charged three times for the same order and
+          nobody has fixed this in two weeks."
+Reasoning: Repeated billing failure + failed prior support contact.
+           Not a simple discrepancy — pattern of system failure.
+           Requires billing team access beyond support scope.
+Action: ESCALATE — transfer to billing tier 2 with full context
+
+EXAMPLE 3 — Resolve directly:
+Customer: "Order O100 was delivered but I never received it.
+          Can you refund me?"
+Reasoning: Single delivery exception, verified customer, order
+           amount within the $500 agent refund limit. Clear policy
+           path: refund the delivered-but-missing order. No
+           pattern of abuse on the account.
+Action: RESOLVE — call lookup_order to confirm amount, then
+        process_refund for the full order total
+
+EXAMPLE 4 — Escalate:
+Customer: "I want a full refund on my $750 Enterprise plan
+          purchase from last week."
+Reasoning: Refund amount exceeds the $500 agent limit enforced by
+           the refund-policy hook. Retrying within scope will be
+           blocked. Decision authority sits with senior support.
+Action: ESCALATE — call escalate_to_human with the order ID,
+        customer ID, and requested amount; do NOT attempt the
+        refund call yourself
+
+EXAMPLE 5 — Escalate (customer explicitly asks):
+Customer: "I don't want to deal with a bot. Connect me to a
+          real human agent."
+Reasoning: The customer has explicitly requested a human. An explicit
+           request is its own escalation trigger — it overrides the
+           normal resolve-first path. Do not insist on verification or
+           troubleshooting; honor the request right away.
+Action: ESCALATE — call escalate_to_human with reason
+        "customer explicitly requested a human agent"
+
+────────────────────────────────────────────────
+Decision rule of thumb:
+  RESOLVE   → single issue, within policy limits, tools available,
+              error is self-correctable
+  ESCALATE  → customer explicitly asks for a human, repeated failures,
+              exceeds agent authority (e.g. $500 refund cap),
+              permission errors, or pattern of abuse
+  HOW       → to escalate, CALL the escalate_to_human tool — don't just
+              describe the handoff in prose
+────────────────────────────────────────────────"""
+    
     result_text = run_agentic_loop(system_prompt, task_prompt, tools)
 
-    # Return a structured finding so the coordinator can pass reliable context to
-    # the next subagent and later include both results in the final summary.
+    # Ep 03: wrap result as a structured finding object (not raw prose)
     return {
         "subagent_role": role,
-        "task" : task_prompt[:100],
-        "result": result_text,
-        "status":"complete"
+        "task":          task_prompt[:100],
+        "result":        result_text,
+        "status":        "complete"
     }
 
+
 def coordinator(customer_id: str, order_id: str) -> str:
-    # The coordinator owns the high-level workflow. It decomposes the case into
-    # verification and refund tasks, passes the first finding forward, and then
-    # combines both subagent responses for the caller.
+    """
+    Ep 02 concept: coordinator decomposition.
+    Coordinator breaks the request into subtasks and delegates.
+    Each subagent gets ONLY the context needed for its role.
+
+    Ep 03 concept: structured context passing.
+    Findings from subagent 1 are passed to subagent 2 as a typed object,
+    not as a free-form prose summary.
+    """
     print("\n" + "="*60)
-    print("COORDINATOR: Decomposing Task")
+    print("COORDINATOR: Decomposing task")
     print("="*60)
 
-    # Verify the customer before allowing the refund workflow to proceed. This
-    # subagent receives only the customer lookup tool.
-    verification_task = f"""Task: Look up customer {customer_id} and confirm if they exist.
-    Return their name and plan tier."""
+    # Reset session state at the start of every coordinator run so each
+    # case starts unverified. The prerequisite_gate will block refund/lookup
+    # until the Customer Verifier subagent successfully runs get_customer.
+    session["customer_verified"] = False
+    session["customer_id"]       = None
+
+    # ── Subtask 1: verify the customer (Subagent 1) ──
+    # Only gets customer_id — nothing else. Context isolation.
+    verification_task = f"""Task: Look up customer {customer_id} and confirm they exist.
+Return their name and plan tier."""
 
     verification_finding = run_subagent(
         role="Customer Verifier",
         task_prompt=verification_task,
-        tools=[TOOLS[0]]
+        tools=[TOOLS[0]]  # only get_customer
     )
 
-    # Make the first subagent's structured output visible and include it in the
-    # second task as prior context rather than starting the refund analysis blind.
-    print("\n [COORDINATOR] Passing structured finding to next subAgent:")
-    print(f" {json.dumps(verification_finding, indent=2)}")
+    # ── Ep 03: pass structured finding to next subagent ──
+    # Not "here's what the last agent found" as prose.
+    # A typed dict with explicit fields.
+    print("\n  [COORDINATOR] Passing structured finding to next subagent:")
+    print(f"  {json.dumps(verification_finding, indent=2)}")
 
-    # The refund subagent gets both order lookup and refund tools. Its instructions
-    # require it to verify ownership before calling the side-effecting refund tool.
-    refund_task = f"""Task : Process a refund for order {order_id}.
-    PRIOR VERIFICATION (from Customer Verified subagent):
-    {json.dumps(verification_finding, indent = 2)}
-    
-    Steps:
-    1. Lookup the order.
-    2. Confirm if it belongs to the customer {customer_id}
-    3. If confirmed, process the refund for the order    
-"""
+    # ── Subtask 2: process the refund (Subagent 2) ──
+    # Gets the verification finding explicitly — context must be passed
+    refund_task = f"""Task: Process a refund for order {order_id}.
+
+PRIOR VERIFICATION (from Customer Verifier subagent):
+{json.dumps(verification_finding, indent=2)}
+
+Steps:
+1. Look up the order
+2. Confirm it belongs to customer {customer_id}
+3. If confirmed, process the refund for the full order amount"""
 
     refund_finding = run_subagent(
-        role="Refund processor",
+        role="Refund Processor",
         task_prompt=refund_task,
-        tools=[TOOLS[1], TOOLS[2]]
+        tools=[TOOLS[1], TOOLS[2]]  # lookup_order + process_refund
     )
 
-    # Present one human-readable result containing both independent findings.
+    # ── Coordinator aggregates results (Ep 02: result aggregation) ──
     print("\n" + "="*60)
     print("COORDINATOR: Aggregating results")
     print("="*60)
 
     final_summary = f"""
-    Customer support case resolved.
-    Verification: {verification_finding['result']}
-    Refund: {refund_finding['result']}
-    """
+Customer support case resolved.
+
+Verification: {verification_finding['result']}
+Refund:       {refund_finding['result']}
+"""
     print(final_summary)
     return final_summary
 
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Run the example only when this file is executed directly. Importing the file
-    # elsewhere will define the tools and functions without starting an API call.
+    print("=" * 64)
+    print("  Claude Certified Architect — Capstone Project")
+    print("  Multi-agent customer support: resolve vs. escalate")
+    print("=" * 64)
+
+    # ── Scenario 1: the coordinator works a refund case ──
+    # Verify the customer, pass the finding forward, then attempt the refund.
+    # (C001 + O102 is the $750 order — it trips the PreToolUse refund-policy
+    #  BLOCK, our first escalation trigger: a request beyond agent authority.)
     print("""
-
-Scenario: Customer C001 wants a refund for order 0100.
-The coordinator will:
-    1. Spawn a Customer Verified subagent
-    2. Pass it's structured finding forward
-    3. Spawn a refund Proceessor Subagent
-    4. Aggregate the results
-
-Each Subagent will run it's own agentic loop
+SCENARIO 1 — Coordinated refund
+  1. Spawn a Customer Verifier subagent  (Ep02: decomposition)
+  2. Pass its structured finding forward (Ep03: context passing)
+  3. Spawn a Refund Processor subagent   (Ep02: delegation)
+  4. Aggregate the results               (Ep02: aggregation)
+Each subagent runs its own agentic loop  (Ep01: stop_reason)
 """)
+    coordinator(customer_id="C001", order_id="O102")
 
-coordinator(customer_id="C001", order_id="0100")
+    # ── Scenario 2: the customer explicitly asks for a human ──
+    # An explicit request is its own escalation trigger. The agent has the
+    # full toolset, but it should CHOOSE escalate_to_human over trying to
+    # resolve the issue itself.
+    print("\n\nSCENARIO 2 — Customer explicitly asks for a human\n")
+    escalation_message = (
+        "Task: Handle this customer message and decide whether to resolve "
+        "or escalate.\n\n"
+        'Customer: "I don\'t want to deal with a bot. '
+        'Connect me to a real human agent."'
+    )
+    run_subagent(
+        role="Support Agent",
+        task_prompt=escalation_message,
+        tools=TOOLS,   # full toolset — the agent must CHOOSE to escalate
+    )
 
-print("\n Try changing customer_id to 'C999' to see error handling.")
-print("\n Try order_id to '0101' to see 'already refunded' cases")
+    print("\n" + "─" * 64)
+    print("Try it yourself:")
+    print("  • Scenario 1: order_id 'O101'  → 'already refunded' case")
+    print("  • Scenario 1: customer 'C999'  → verification fails")
+    print("  • Scenario 1: order_id 'O100'  → small refund, resolves cleanly")
+    print("  • Scenario 2: swap in a normal question → agent resolves, no escalation")
