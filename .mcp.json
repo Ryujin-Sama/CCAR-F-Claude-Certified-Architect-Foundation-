@@ -1,0 +1,40 @@
+{
+    "mcpServers" : {
+        
+
+        "fileSystem": {
+            "description":"Provides filesystem access to the workspace files",
+            "type":"stdio",
+            "command":"npx",
+            "args":["-y", "@modelcontextprotocol/server-filesystem","/workspace"],
+            "resources":[
+                {"url" : "file://work/src", "name" : "Source root"},
+                {"url" : "file://work/docs", "name" : "project docs"}
+            ]
+        },
+
+        "github" :{
+            "description":"Connects to GitHub through the configured MCP endpoint",
+            "type":"http",
+            "url" :"https://github.com/mcp",
+            "env":{
+                "GITHUB+TOKEN":"${GITHUB_TOKEN}"
+            }
+        },
+
+        "semantic-search":{
+            "description":"Runs semantic code search against the configured vector database",
+            "type" : "stdio",
+            "command":"node",
+            "args" :["./tools/semantic-search-service.js"],
+            "env":{
+                "VECTOR_DB_URL" : "${VECTOR_DB_URL}"
+            },
+            "toolOverrides":{
+                "search_code":{
+                    "description":"Vector semantic search, USE INSTEAD of Grep when the query describes intent or concept"
+                }
+            }
+        }
+    }
+}
